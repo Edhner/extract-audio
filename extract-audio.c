@@ -118,7 +118,8 @@ main(int argc, char **argv)
 	evhtp_headers_add_header(request->headers_out,
 				 evhtp_header_new("Host", host, 0, 0));
 	evhtp_headers_add_header(request->headers_out,
-				 evhtp_header_new("Connection", "close", 0, 0));
+				 evhtp_header_new("Connection", "keep-alive",
+						  0, 0));
 	evhtp_headers_add_header(request->headers_out,
 				 evhtp_header_new("User-Agent", "extract-audio",
 						  0, 0));

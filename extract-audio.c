@@ -11,8 +11,20 @@
 #include <event2/dns.h>
 
 
+static void download_data(int start_point, int size);
+
 struct event_base *base;
 
+/* State variables:
+ *
+ * Since only one file is handled we only need to store one state which makes
+ * file global varialbes easiest (it is also possible to store state in user
+ * data that is added to the evhtp request, but that is not needed here)
+ */
+
+evhtp_connection_t *conn;
+char *path;
+char *host;
 static void
 terminate(int sig, short why, void *data)
 {
@@ -59,16 +71,43 @@ static void usage()
 		"Usage: extract-audio -h <host> -n <port> -p <path>\n");
 }
 
+static void
+download_data(int start_point, int size)
+{
+	evhtp_request_t *request;
+
+	int end_point = start_point + size;
+	char range_string[100];
+
+	sprintf(range_string, "bytes=%d-%d", start_point, end_point);
+
+	request = evhtp_request_new(request_finished, base);
+	evhtp_set_hook(&request->hooks, evhtp_hook_on_read, dump_data, NULL);
+
+
+	evhtp_headers_add_header(request->headers_out,
+				 evhtp_header_new("Host", host, 0, 0));
+	evhtp_headers_add_header(request->headers_out,
+				 evhtp_header_new("Connection", "keep-alive",
+						  0, 0));
+	evhtp_headers_add_header(request->headers_out,
+				 evhtp_header_new("User-Agent", "extract-audio",
+						  0, 0));
+	evhtp_headers_add_header(request->headers_out,
+				 evhtp_header_new("Range", range_string,
+						  0, 0));
+
+	evhtp_make_request(conn, request, htp_method_GET, path);
+
+	moov_size = 0;
+}
+
 int
 main(int argc, char **argv)
 {
-	evhtp_connection_t *conn;
-	evhtp_request_t *request;
 	struct evdns_base *dns_base;
 	struct event *ev_sigterm;
 	struct event *ev_sigint;
-	char *host = NULL;
-	char *path = NULL;
 	int port = 80;
 	int c;
 
@@ -111,23 +150,7 @@ main(int argc, char **argv)
 	dns_base = evdns_base_new(base, 1);
 	conn = evhtp_connection_new_dns(base, dns_base, host, port);
 
-	request = evhtp_request_new(request_finished, base);
-	evhtp_set_hook(&request->hooks, evhtp_hook_on_read, dump_data, NULL);
-
-
-	evhtp_headers_add_header(request->headers_out,
-				 evhtp_header_new("Host", host, 0, 0));
-	evhtp_headers_add_header(request->headers_out,
-				 evhtp_header_new("Connection", "keep-alive",
-						  0, 0));
-	evhtp_headers_add_header(request->headers_out,
-				 evhtp_header_new("User-Agent", "extract-audio",
-						  0, 0));
-	evhtp_headers_add_header(request->headers_out,
-				 evhtp_header_new("Range", "bytes=0-8",
-						  0, 0));
-
-	evhtp_make_request(conn, request, htp_method_GET, path);
+	download_data(0, 8);
 
 	/* Add SIGTERM and SIGINT to base */
 	ev_sigterm = evsignal_new(base, SIGTERM, terminate, NULL);

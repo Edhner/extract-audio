@@ -37,6 +37,8 @@ struct chunk_data *chunks;
 int chunk;
 int nbr_of_chunks;
 
+int mp4_file_verified;
+
 static void*
 get_box(void *data, char *box_name, uint32_t box_size, int box_no)
 {
@@ -223,6 +225,15 @@ dump_data(evhtp_request_t *req, evbuf_t *buf, void *arg)
 			return EVHTP_RES_FATAL;
 		}
 		moov_size += length;
+		if (!mp4_file_verified) {
+			struct box_header *box = moov;
+			if (strncmp(box->name, "ftyp", 4) != 0) {
+				fprintf(stderr, "Invalid mp4 file!\n");
+				free_exit();
+				return EVHTP_RES_FATAL;
+			}
+			mp4_file_verified = 1;
+		}
 	} else {
 		void *data = malloc(length);
 		if (data == NULL) {

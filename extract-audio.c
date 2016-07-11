@@ -123,6 +123,9 @@ main(int argc, char **argv)
 	evhtp_headers_add_header(request->headers_out,
 				 evhtp_header_new("User-Agent", "extract-audio",
 						  0, 0));
+	evhtp_headers_add_header(request->headers_out,
+				 evhtp_header_new("Range", "bytes=0-8",
+						  0, 0));
 
 	evhtp_make_request(conn, request, htp_method_GET, path);
 

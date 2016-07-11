@@ -9,7 +9,9 @@
 #include <inttypes.h>
 #include <evhtp.h>
 #include <event2/dns.h>
+#include <arpa/inet.h>
 
+#include "extract-audio.h"
 
 static void download_data(int start_point, int size);
 
@@ -25,16 +27,184 @@ struct event_base *base;
 evhtp_connection_t *conn;
 char *path;
 char *host;
+
+void *moov;
+int moov_size;
+struct generic_box *moov_box;
+int offset;
+
+struct chunk_data *chunks;
+int chunk;
+int nbr_of_chunks;
+
+static void*
+get_box(void *data, char *box_name, uint32_t box_size, int box_no)
+{
+	void *tmp = data;
+	struct box_header *sub_box = tmp;
+	int bytes_left = box_size;
+	int found_boxes = 0;
+
+	while (bytes_left > 0) {
+		if (strncmp(sub_box->name, box_name, 4) == 0) {
+			found_boxes++;
+			if (found_boxes == box_no) {
+				return tmp;
+			}
+		}
+
+		bytes_left -= ntohl(sub_box->size);
+		tmp += ntohl(sub_box->size);
+		sub_box = tmp;
+	}
+	return NULL;
+}
+
 static void
-terminate(int sig, short why, void *data)
+free_exit()
 {
 	event_base_loopexit(base, NULL);
 }
 
 static void
+terminate(int sig, short why, void *data)
+{
+	free_exit();
+}
+
+static int
+track_is_audio(struct generic_box *trak)
+{
+	struct generic_box *mdia = get_box(trak->data, "mdia",
+					   ntohl(trak->header.size), 1);
+	struct generic_box *minf = get_box(mdia->data, "minf",
+					   ntohl(trak->header.size), 1);
+	struct generic_box *stbl = get_box(minf->data, "stbl",
+					   ntohl(minf->header.size), 1);
+	struct stsd_box *stsd = get_box(stbl->data, "stsd",
+					ntohl(stbl->header.size), 1);
+
+	if (strncmp(stsd->sample_entry.header.name, "mp4a", 4) == 0) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+static int
+get_audio_chunks()
+{
+	int track_no = 1;
+	int i;
+	int smp = 0;
+	struct generic_box *trak = get_box(moov_box->data, "trak",
+					   ntohl(moov_box->header.size),
+					   track_no);
+	while (!track_is_audio(trak)) {
+		track_no++;
+		trak = get_box(moov_box->data, "trak",
+			       ntohl(moov_box->header.size), track_no);
+		if (trak == NULL) {
+			/* Can not find any more tracks */
+			fprintf(stderr, "Could not find any audio tracks!");
+			return -1;
+		}
+	}
+
+	struct generic_box *mdia = get_box(trak->data, "mdia",
+					   ntohl(trak->header.size), 1);
+	struct generic_box *minf = get_box(mdia->data, "minf",
+					   ntohl(trak->header.size), 1);
+	struct generic_box *stbl = get_box(minf->data, "stbl",
+					   ntohl(minf->header.size), 1);
+
+	struct stco_box *stco = get_box(stbl->data, "stco",
+					ntohl(stbl->header.size), 1);
+	struct stsc_box *stsc = get_box(stbl->data, "stsc",
+					ntohl(stbl->header.size), 1);
+	struct stsz_box *stsz = get_box(stbl->data, "stsz",
+					ntohl(stbl->header.size), 1);
+
+	nbr_of_chunks = ntohl(stco->entry_count);
+	chunks = calloc(nbr_of_chunks, sizeof(struct chunk_data));
+
+	uint32_t *p = &stco->chunk_offset;
+	for (i = 0; i < nbr_of_chunks; ++i) {
+		chunks[i].samples = -1;
+		chunks[i].position = ntohl(*p);
+		p++;
+	}
+
+	uint32_t *p_first_chunk = &stsc->first_chunk;
+	uint32_t *p_samples_per_chunk = &stsc->samples_per_chunk;
+	for (i = 0; i < ntohl(stsc->entry_count); ++i) {
+		chunks[ntohl(*p_first_chunk) - 1].samples = ntohl(*p_samples_per_chunk);
+
+		p_first_chunk += 3;
+		p_samples_per_chunk += 3;
+	}
+
+	for (i = 0; i < nbr_of_chunks; ++i) {
+		if (chunks[i].samples != -1) {
+			smp = chunks[i].samples;
+		} else {
+			chunks[i].samples = smp;
+		}
+	}
+
+	uint32_t *p_entry_size = &stsz->entry_size;
+	if (stsz->sample_size != 0) {
+		for (i = 0; i < nbr_of_chunks; ++i) {
+			chunks[i].size = ntohl(stsz->sample_size) * chunks[i].samples;
+		}
+	} else {
+		int j;
+		for (i = 0; i < nbr_of_chunks; ++i) {
+			for (j = 0; j < chunks[i].samples; ++j) {
+				chunks[i].size += ntohl(*p_entry_size);
+				p_entry_size++;
+			}
+		}
+	}
+	return 0;
+}
+
+static void
 request_finished(evhtp_request_t *req, void *arg)
 {
-	event_base_loopexit(base, NULL);
+	if (moov_box == NULL) {
+		moov_box = get_box(moov, "moov", moov_size, 1);
+		if (moov_box == NULL) {
+			struct box_header *box = moov;
+			offset += ntohl(box->size);
+			download_data(offset, 8);
+			free(moov);
+			return;
+		}
+		/* We have the moov header, now we download the entire box */
+		download_data(offset, ntohl(moov_box->header.size));
+
+		void *p;
+		p = realloc(moov, ntohl(moov_box->header.size));
+		if (p == NULL) {
+			fprintf(stderr,
+				"Fatal error! Could not allocate memory!\n");
+			free_exit();
+		}
+		moov = p;
+		return;
+	} else if (moov_box != NULL && chunks == NULL) {
+		moov_box = get_box(moov, "moov", moov_size, 1);
+		if (get_audio_chunks() == -1) {
+			event_base_loopexit(base, NULL);
+		}
+	}
+	if (chunks != NULL && chunk < nbr_of_chunks) {
+		download_data(chunks[chunk].position, chunks[chunk].size);
+		chunk++;
+	} else if (chunk >= nbr_of_chunks) {
+		free_exit();
+	}
 }
 
 static evhtp_res
@@ -47,21 +217,29 @@ dump_data(evhtp_request_t *req, evbuf_t *buf, void *arg)
 		return -1;
 	}
 
-	void *data = malloc(length);
-	if (data == NULL) {
-		fprintf(stderr, "Fatal error! Could not allocate memory!\n");
-		return EVHTP_RES_FATAL;
-	}
-	if (evbuffer_remove(buf, data, length) == -1) {
-		fprintf(stderr, "Fatal error!\n");
-		return EVHTP_RES_FATAL;
-	}
-	if (write(1, data, length) == -1) {
-		fprintf(stderr, "Fatal error!\n");
-		return EVHTP_RES_FATAL;
+	if (chunks == NULL) {
+		if (evbuffer_remove(buf, moov + moov_size, length) == -1) {
+			fprintf(stderr, "Fatal error!\n");
+			return EVHTP_RES_FATAL;
+		}
+		moov_size += length;
+	} else {
+		void *data = malloc(length);
+		if (data == NULL) {
+			fprintf(stderr, "Fatal error! Could not allocate memory!\n");
+			return EVHTP_RES_FATAL;
+		}
+		if (evbuffer_remove(buf, data, length) == -1) {
+			fprintf(stderr, "Fatal error!\n");
+			return EVHTP_RES_FATAL;
+		}
+		if (write(1, data, length) == -1) {
+			fprintf(stderr, "Fatal error!\n");
+			return EVHTP_RES_FATAL;
+		}
+		free(data);
 	}
 
-	free(data);
 	return EVHTP_RES_OK;
 }
 
@@ -145,6 +323,12 @@ main(int argc, char **argv)
 		return -1;
 	}
 
+	moov = malloc(8);
+	if (moov == NULL) {
+		fprintf(stderr, "Fatal error! Could not allocate memory!\n");
+		return -1;
+	}
+
 	base = event_base_new();
 
 	dns_base = evdns_base_new(base, 1);
@@ -162,5 +346,11 @@ main(int argc, char **argv)
 	free(ev_sigint);
 	free(ev_sigterm);
 
+	if (moov != NULL) {
+		free(moov);
+	}
+	if (chunks != NULL) {
+		free(chunks);
+	}
 	return 0;
 }

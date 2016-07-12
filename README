@@ -1,0 +1,16 @@
+Small application that extracts the first audio track it can find from an mp4 file
+and sends it to stdout.
+
+The application is based on the following libraries:
+
+libevent - http://libevent.org/
+libevhtp - https://github.com/ellzey/libevhtp
+
+Compile:
+gcc extract-audio.c -I /usr/include/evhtp/ -Wall -Werror -levhtp -levent -o extract-audio -O2
+
+Run:
+extract-audio -h <host> -n <port> -p <path>
+
+Example:
+./extract-audio -h distribution.bbb3d.renderfarming.net -p /video/mp4/bbb_sunflower_native_60fps_stereo_abl.mp4 | mpg321 -
